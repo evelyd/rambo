@@ -481,7 +481,9 @@ class QPEnvCfg(DirectRLEnvCfg):
         num_actions = 1  # to avoid zero action dimension
 
     history_length = 5  # include the current state
-    num_obs_per_step = 1 + 3 + 3 + 3 + 12 + 12 + 4 + 4 + 12 + 3 + num_actions + 3 + 3 + 3 + 3
+    # num_obs_per_step = 1 + 3 + 3 + 3 + 12 + 12 + 4 + 4 + 12 + 3 + num_actions + 3 + 3 + 3 + 3
+    # num_obs_per_step = 3 + 3 + 12 + 12 + 4 + 4 + 12 + 3 + num_actions + 3 + 3 + 3 + 3 #no base height, base lin vel
+    num_obs_per_step = 1 + 3 + 3 + 12 + 12 + 4 + 4 + 12 + 3 + num_actions + 3 + 3 + 3 + 3 #no base lin vel
     num_observations = num_obs_per_step * history_length
 
     observation_space = num_observations
@@ -1033,7 +1035,7 @@ class QPEnv(DirectRLEnv):
         latest_obs = torch.cat((
             self.base_height.unsqueeze(-1),
             self.projected_gravity_b,
-            self.base_lin_vel_b,
+            # self.base_lin_vel_b,
             self.base_ang_vel_b,
             self.joint_pos - self._robot.data.default_joint_pos,
             self.joint_vel,
@@ -1270,7 +1272,12 @@ class QPEnv(DirectRLEnv):
 
     @property
     def base_height(self):
-        return self.base_pos_w[:, 2].clone()
+        # Get base height using fk
+        foot_positions_base_frame = self.ee_pos_b
+        feet_z_coords = foot_positions_base_frame[:, :, 2]
+        lowest_foot_z, _ = torch.min(feet_z_coords, dim=1)
+        estimated_height = -lowest_foot_z
+        return estimated_height
 
     @property
     def base_quat(self):
