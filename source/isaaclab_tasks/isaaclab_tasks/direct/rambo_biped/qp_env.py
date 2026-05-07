@@ -9,7 +9,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensor, ContactSensorCfg
+from isaaclab.sensors import ContactSensor, ContactSensorCfg, Imu, ImuCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
@@ -25,6 +25,7 @@ from isaaclab.actuators import DelayedDCMotorCfg
 from isaaclab_assets import UNITREE_GO2_CFG
 from .modules import ContactGenerator, JointPositionController, QPTorqueOptimizer
 from .utils.helper import to_torch
+from .utils.supervised_learning_networks import SimpleNN
 
 NOMINAL_BASE_HEIGHT = 0.45
 FOOT_HEIGHT = 0.15
@@ -96,8 +97,11 @@ FR_FORCE_Z = [-20.0, 20.0]
 # FR_FORCE_Y = [-0.0, 40.0]
 # FR_FORCE_Z = [-0.0, 0.0]
 
-SYMMETRIC = True
+SYMMETRIC = True #TODO what does this do?
 
+# State estimator params
+TRAIN_INTERVAL = 50
+START_USING_SE_STEP = 2000
 
 @configclass
 class EventCfg:
@@ -461,6 +465,14 @@ class QPEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Robot/.*", history_length=3, update_period=0.005, track_air_time=True
     )
 
+    # Same IMU as used in basic locomotion repo
+    imu = ImuCfg(
+        prim_path="/World/envs/env_.*/Robot/base",
+        offset=ImuCfg.OffsetCfg(
+            pos=(-0.02557, 0, 0.04232)
+        ),
+        debug_vis=False)
+
     add_feedforward_torque = FF_TORQUE
 
     including_base_action = BASE_ACTION
@@ -482,7 +494,10 @@ class QPEnvCfg(DirectRLEnvCfg):
 
     history_length = 5  # include the current state
     num_obs_per_step = 1 + 3 + 3 + 3 + 12 + 12 + 4 + 4 + 12 + 3 + num_actions + 3 + 3 + 3 + 3
+    # num_obs_per_step = 3 + 3 + 3 + 12 + 12 + 4 + 4 + 12 + 3 + num_actions + 3 + 3 + 3 + 3 # no base height
     num_observations = num_obs_per_step * history_length
+
+    se_single_obs_dim = 3 + 3 + 3 + 12 + 12 + num_actions # imu acc, proj grav, imu ang vel, joint pos, joint vel, last action
 
     observation_space = num_observations
     action_space = num_actions
@@ -681,11 +696,30 @@ class QPEnv(DirectRLEnv):
         self._prepare_rewards()
         self.set_debug_vis(self.cfg.velocity_debug_vis, self.cfg.pos_debug_vis, self.cfg.force_debug_vis)
 
+        # state estimator setup
+        # state est input space: projected_gravity(3) + base_ang_vel(3) + joint_pos(12) + joint_vel(12) + last_action(num_actions)
+        self.single_se_obs_dim = self.cfg.se_single_obs_dim
+        self.se_history_length = self.cfg.history_length
+        self.total_se_input_dim = self.single_se_obs_dim * self.se_history_length
+        self.state_estimator = SimpleNN(in_features=self.total_se_input_dim, out_features=3, learning_rate=1e-3).to(self.device)
+
+        # History buffer specifically for the SE
+        self._se_obs_history = torch.zeros(
+            self.num_envs, self.se_history_length, self.single_se_obs_dim, device=self.device
+        )
+
+        self._latest_estimated_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
+
+        self._latest_se_train_loss = 0.0
+        self._latest_se_val_loss = 0.0
+
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self._robot
         self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         self.scene.sensors["contact_sensor"] = self._contact_sensor
+        self._imu = Imu(self.cfg.imu)
+        self.scene.sensors["imu"] = self._imu
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
@@ -878,6 +912,23 @@ class QPEnv(DirectRLEnv):
 
         in_contact = torch.any(self.contact_generator.desired_contact_state, dim=-1)
         self.extras['log']["Step Log/QP Cost"] = torch.mean(qp_cost * in_contact.float())
+
+        # Train the state estimator
+        if self.common_step_counter > 0 and self.common_step_counter % TRAIN_INTERVAL == 0:
+            # We only train for 2 epochs per interval to keep the simulation fast
+            train_loss, val_loss = self.state_estimator.train_network(
+                batch_size=512,
+                epochs=2,
+                device=self.device,
+                validation_split=0.1
+            )
+
+            self._latest_se_train_loss = train_loss
+            self._latest_se_val_loss = val_loss
+
+        self.extras["log"]["State_Estimator/Train_Loss"] = self._latest_se_train_loss
+        self.extras["log"]["State_Estimator/Val_Loss"] = self._latest_se_val_loss
+
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -1028,13 +1079,27 @@ class QPEnv(DirectRLEnv):
         self.contact_generator.reset_idx(env_ids)
         self.desired_joint_pos[env_ids] = self.joint_position_controller.reset_idx(env_ids)
 
+        # Clear the state estimator history for the environments that just fell
+        self._se_obs_history[env_ids] = 0.0
+
     def _get_observations(self) -> dict:
+        # Set up for the state est
+        se_input = self._get_se_observations()
+        ground_truth_lin_vel = self.base_lin_vel_b.clone()
+        self.state_estimator.dataset.add_sample(se_input, ground_truth_lin_vel)
+
+        if self.common_step_counter > START_USING_SE_STEP:
+            with torch.no_grad():
+                self._latest_estimated_lin_vel = self.state_estimator(se_input)
+        else:
+            self._latest_estimated_lin_vel = ground_truth_lin_vel
+
         # states from GC and may be noisy
         latest_obs = torch.cat((
-            self.base_height.unsqueeze(-1),
+            self.base_height_fk.unsqueeze(-1),
             self.projected_gravity_b,
-            self.base_lin_vel_b,
-            self.base_ang_vel_b,
+            self._latest_estimated_lin_vel,
+            self.base_ang_vel_imu,
             self.joint_pos - self._robot.data.default_joint_pos,
             self.joint_vel,
             self.contact_generator.desired_contact_phase,
@@ -1055,6 +1120,26 @@ class QPEnv(DirectRLEnv):
             self._obs_history = latest_obs.unsqueeze(1)
 
         return {"policy": self._obs_history.view(self.num_envs, -1)}
+
+    def _get_se_observations(self) -> torch.Tensor:
+        """Builds the history of unprivileged data for the State Estimator."""
+        latest_se_obs = torch.cat((
+            self.base_lin_acc_imu,
+            self._robot.data.projected_gravity_b,
+            self.base_ang_vel_imu,
+            self.joint_pos - self._robot.data.default_joint_pos,
+            self.joint_vel,
+            self._last_action,
+        ), dim=-1)
+
+        # Shift history: drop oldest, add newest
+        if self.se_history_length > 1:
+            self._se_obs_history = torch.cat((self._se_obs_history[:, 1:], latest_se_obs.unsqueeze(1)), dim=1)
+        else:
+            self._se_obs_history = latest_se_obs.unsqueeze(1)
+
+        # Flatten the history for the MLP
+        return self._se_obs_history.view(self.num_envs, -1)
 
     def _prepare_rewards(self):
         self._episode_sums = {
@@ -1273,6 +1358,15 @@ class QPEnv(DirectRLEnv):
         return self.base_pos_w[:, 2].clone()
 
     @property
+    def base_height_fk(self):
+        # Get base height using fk
+        foot_positions_base_frame = self.ee_pos_b
+        feet_z_coords = foot_positions_base_frame[:, :, 2]
+        lowest_foot_z, _ = torch.min(feet_z_coords, dim=1)
+        estimated_height = -lowest_foot_z
+        return estimated_height
+
+    @property
     def base_quat(self):
         return self.generalized_coordinates[:, 3:7].clone()
 
@@ -1314,6 +1408,16 @@ class QPEnv(DirectRLEnv):
     def base_lin_vel_b(self):
         # from GC
         return math_utils.quat_rotate_inverse(self.base_quat, self.base_lin_vel_w)
+
+    @property
+    def base_lin_acc_imu(self):
+        # from IMU
+        return self._imu.data.lin_acc_b.clone()
+
+    @property
+    def base_ang_vel_imu(self):
+        # from IMU
+        return self._imu.data.ang_vel_b.clone()
 
     @property
     def base_ang_vel_b(self):

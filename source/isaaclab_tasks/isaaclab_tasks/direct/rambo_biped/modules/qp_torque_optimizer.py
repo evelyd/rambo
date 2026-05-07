@@ -67,10 +67,10 @@ class QPTorqueOptimizer:
         # get current quantities from the environment
         # all quantities are expressed in the projected com frame
         curr_base_pos = torch.zeros((self._num_envs, 3), device=self._device)
-        curr_base_pos[:, 2] = self._env.base_height
+        curr_base_pos[:, 2] = self._env.base_height_fk
         curr_base_quat = self._env.base_quat_rp
-        curr_base_lin_vel = math_utils.quat_apply(curr_base_quat, self._env.base_lin_vel_b)
-        curr_base_ang_vel = math_utils.quat_apply(curr_base_quat, self._env.base_ang_vel_b)
+        curr_base_lin_vel = math_utils.quat_apply(curr_base_quat, self._env._latest_estimated_lin_vel)
+        curr_base_ang_vel = math_utils.quat_apply(curr_base_quat, self._env.base_ang_vel_imu)
 
         self.desired_acc = compute_desired_acc(
             curr_base_pos,

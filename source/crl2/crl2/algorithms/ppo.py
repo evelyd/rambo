@@ -286,6 +286,14 @@ class PPO:
             save_dict["obs_normalizer"] = self.obs_normalizer.state_dict()
         torch.save(save_dict, path)
 
+        # Save the state estimator
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        if hasattr(base_env, "state_estimator"):
+            # Create a matching filename: e.g., model_1000.pt -> model_1000_se.pt
+            se_path = path.replace(".pt", "_se.pt")
+            base_env.state_estimator.save_network(se_path, device=self.device)
+            print(f"Saved State Estimator to: {se_path}")
+
     def load(self, path, load_values=False, load_optimizer=False):
         loaded_dict = torch.load(path)
         self.policy.load_state_dict(loaded_dict['policy_dict'])
@@ -297,6 +305,22 @@ class PPO:
         if self.alg_cfg['empirical_normalization']:
             self.obs_normalizer.load_state_dict(loaded_dict['obs_normalizer'])
         self.current_iteration = loaded_dict['iteration']
+
+        # Load the state estimator
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        if hasattr(base_env, "state_estimator"):
+            se_path = path.replace(".pt", "_se.pt")
+            if os.path.exists(se_path):
+                # Load the checkpoint dictionary
+                checkpoint = torch.load(se_path, map_location=self.device)
+
+                # Extract the state dict and apply it to the existing env network
+                base_env.state_estimator.load_state_dict(checkpoint['model_state_dict'])
+                base_env.state_estimator.eval()  # Put it in eval mode
+                print(f"Successfully loaded State Estimator from: {se_path}")
+            else:
+                print(f"Warning: Could not find matching State Estimator checkpoint at {se_path}")
+
         return loaded_dict['infos']
 
     def get_inference_policy(self, device=None):
